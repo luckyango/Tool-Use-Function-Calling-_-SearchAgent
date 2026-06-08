@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.deps/
+.deps_sandbox/
+.env
+.venv/
+venv/
+

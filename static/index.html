@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SearchCalc Agent</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">OpenAI Function Calling Demo</p>
+          <h1>SearchCalc Agent</h1>
+        </div>
+        <button class="ghost-button" id="resetButton" type="button">Reset</button>
+      </header>
+
+      <section class="workspace" aria-label="Agent workspace">
+        <section class="chat-panel" aria-label="Chat">
+          <div class="messages" id="messages">
+            <article class="message assistant">
+              <span class="role">Agent</span>
+              <p>
+                Ask me something that needs search, calculation, unit conversion, or a mix of all three.
+              </p>
+            </article>
+          </div>
+
+          <div class="examples" aria-label="Example prompts">
+            <button type="button">How far is the Earth from the Moon in kilometers? Convert it to miles.</button>
+            <button type="button">If I save $2,000 per month at 3% annual interest for 5 years, how much will I have?</button>
+            <button type="button">What are the important new features in Python 3.12?</button>
+            <button type="button">Convert 180 cm to feet.</button>
+          </div>
+
+          <form class="composer" id="chatForm">
+            <input
+              id="messageInput"
+              type="text"
+              autocomplete="off"
+              placeholder="Ask a question..."
+              aria-label="Message"
+            />
+            <button id="sendButton" type="submit">Send</button>
+          </form>
+        </section>
+
+        <aside class="trace-panel" aria-label="Tool trace">
+          <div class="trace-header">
+            <div>
+              <p class="eyebrow">Live Trace</p>
+              <h2>Tool Calls</h2>
+            </div>
+            <span class="step-count" id="stepCount">0 steps</span>
+          </div>
+          <div class="trace-list" id="traceList">
+            <p class="empty-state">Tool calls will appear here when the agent uses search, math, or conversion.</p>
+          </div>
+        </aside>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
+

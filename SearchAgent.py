@@ -1,33 +1,47 @@
-# search_calc_agent.py
+import ast
 import json
 import math
 import os
-from typing import Optional
-from openai import OpenAI
-from dotenv import load_dotenv
+from dataclasses import dataclass, asdict
+from typing import Any
+
 import requests
-from rich.console import Console
-from rich.panel import Panel
-from rich.markdown import Markdown
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from openai import OpenAI
+from pydantic import BaseModel
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
 
-client = OpenAI()
-console = Console()
+if load_dotenv:
+    load_dotenv()
+
+client: OpenAI | None = None
+
+
+def get_openai_client() -> OpenAI:
+    global client
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError(
+            "OPENAI_API_KEY is not configured. Create a .env file or set the environment variable."
+        )
+    if client is None:
+        client = OpenAI()
+    return client
+
 
 # ============================
 # Tool Implementations
 # ============================
 
 def search_web(query: str, num_results: int = 5) -> str:
-    """
-    Search for information using the DuckDuckGo search engine (free, no API key required)
-    
-    Returns:
-        Summary of search results including titles, links, and abstracts
-    """
+    """Search with DuckDuckGo Instant Answer API."""
     try:
-        # Use DuckDuckGo Instant Answer API
         url = "https://api.duckduckgo.com/"
         params = {
             "q": query,
@@ -35,148 +49,221 @@ def search_web(query: str, num_results: int = 5) -> str:
             "no_html": 1,
             "skip_disambig": 1,
         }
-        
+
         response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
         data = response.json()
-        
-        results = []
-        
-        # Instant answer
+
+        results: list[str] = []
+
         if data.get("AbstractText"):
-            results.append(f"**Instant Answer**: {data['AbstractText']}")
+            results.append(f"Instant Answer: {data['AbstractText']}")
             if data.get("AbstractURL"):
                 results.append(f"Source: {data['AbstractURL']}")
-        
-        # Related topics
+
         for topic in data.get("RelatedTopics", [])[:num_results]:
             if isinstance(topic, dict) and topic.get("Text"):
-                results.append(f"• {topic['Text'][:200]}")
-        
+                results.append(f"- {topic['Text'][:240]}")
+
         if results:
             return "\n".join(results)
-        else:
-            return f"No direct results found for '{query}'. Try searching with more specific keywords."
-            
-    except Exception as e:
-        return f"Search failed: {str(e)}. Please check your network connection."
+        return f"No direct results found for '{query}'. Try more specific keywords."
+    except Exception as exc:
+        return f"Search failed: {exc}. Please check your network connection."
+
+
+ALLOWED_MATH_FUNCS = {
+    "sqrt": math.sqrt,
+    "pow": math.pow,
+    "sin": math.sin,
+    "cos": math.cos,
+    "tan": math.tan,
+    "asin": math.asin,
+    "acos": math.acos,
+    "atan": math.atan,
+    "log": math.log,
+    "log10": math.log10,
+    "log2": math.log2,
+    "exp": math.exp,
+    "abs": abs,
+    "round": round,
+    "ceil": math.ceil,
+    "floor": math.floor,
+    "factorial": math.factorial,
+}
+
+ALLOWED_MATH_CONSTANTS = {
+    "pi": math.pi,
+    "e": math.e,
+    "inf": math.inf,
+}
+
+
+class SafeMathEvaluator(ast.NodeVisitor):
+    """Evaluate a small, explicit subset of Python math expressions."""
+
+    def visit_Expression(self, node: ast.Expression) -> float:
+        return self.visit(node.body)
+
+    def visit_Constant(self, node: ast.Constant) -> float:
+        if isinstance(node.value, (int, float)):
+            return node.value
+        raise ValueError("Only numeric constants are supported")
+
+    def visit_Name(self, node: ast.Name) -> float:
+        if node.id in ALLOWED_MATH_CONSTANTS:
+            return ALLOWED_MATH_CONSTANTS[node.id]
+        raise ValueError(f"Unknown constant: {node.id}")
+
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> float:
+        value = self.visit(node.operand)
+        if isinstance(node.op, ast.UAdd):
+            return value
+        if isinstance(node.op, ast.USub):
+            return -value
+        raise ValueError("Unsupported unary operator")
+
+    def visit_BinOp(self, node: ast.BinOp) -> float:
+        left = self.visit(node.left)
+        right = self.visit(node.right)
+        operators = {
+            ast.Add: lambda: left + right,
+            ast.Sub: lambda: left - right,
+            ast.Mult: lambda: left * right,
+            ast.Div: lambda: left / right,
+            ast.Pow: lambda: left ** right,
+            ast.Mod: lambda: left % right,
+            ast.FloorDiv: lambda: left // right,
+        }
+        for op_type, operation in operators.items():
+            if isinstance(node.op, op_type):
+                return operation()
+        raise ValueError("Unsupported binary operator")
+
+    def visit_Call(self, node: ast.Call) -> float:
+        if not isinstance(node.func, ast.Name):
+            raise ValueError("Only direct math function calls are supported")
+        func = ALLOWED_MATH_FUNCS.get(node.func.id)
+        if not func:
+            raise ValueError(f"Unsupported function: {node.func.id}")
+        args = [self.visit(arg) for arg in node.args]
+        return func(*args)
+
+    def generic_visit(self, node: ast.AST) -> Any:
+        raise ValueError(f"Unsupported expression element: {type(node).__name__}")
 
 
 def calculate(expression: str) -> str:
-    """
-    Evaluate a mathematical expression, supporting complex calculations and math functions.
-    
-    Supported operations:
-    - Basic arithmetic: + - * / ** (exponentiation)
-    - Math functions: sqrt, sin, cos, tan, log, log10, exp, abs, round, ceil, floor
-    - Constants: pi, e
-    - Parentheses and operator precedence
-    
-    Examples:
-    - calculate("(1 + 2) * 3") → 9
-    - calculate("sqrt(144)") → 12.0
-    - calculate("log(e)") → 1.0
-    """
+    """Evaluate a mathematical expression with a safe AST whitelist."""
     try:
-        # Clean input
-        expression = expression.strip()
-        
-        # Safe math environment
-        safe_dict = {
-            "__builtins__": {},
-            "sqrt": math.sqrt,
-            "pow": math.pow,
-            "sin": math.sin,
-            "cos": math.cos,
-            "tan": math.tan,
-            "asin": math.asin,
-            "acos": math.acos,
-            "atan": math.atan,
-            "log": math.log,
-            "log10": math.log10,
-            "log2": math.log2,
-            "exp": math.exp,
-            "abs": abs,
-            "round": round,
-            "ceil": math.ceil,
-            "floor": math.floor,
-            "factorial": math.factorial,
-            "pi": math.pi,
-            "e": math.e,
-            "inf": math.inf,
-        }
-        
-        result = eval(expression, safe_dict)
-        
-        # Format output
+        expression = expression.strip().replace("^", "**")
+        parsed = ast.parse(expression, mode="eval")
+        result = SafeMathEvaluator().visit(parsed)
+
+        if isinstance(result, float) and result == int(result):
+            return f"{expression} = {int(result)}"
         if isinstance(result, float):
-            if result == int(result):
-                return f"{expression} = {int(result)}"
-            else:
-                return f"{expression} = {result:.6g}"
-        else:
-            return f"{expression} = {result}"
-            
+            return f"{expression} = {result:.6g}"
+        return f"{expression} = {result}"
     except ZeroDivisionError:
         return "Calculation error: division by zero"
     except OverflowError:
-        return "Calculation error: result overflow (number too large)"
-    except Exception as e:
-        return f"Calculation error: {str(e)}. Please verify the expression format is correct."
+        return "Calculation error: result overflow"
+    except Exception as exc:
+        return f"Calculation error: {exc}. Please verify the expression format."
 
 
 def unit_converter(value: float, from_unit: str, to_unit: str) -> str:
-    """
-    Unit conversion tool supporting common unit conversions.
-    
-    Supported categories:
-    - Length: m, km, cm, mm, inch, foot, mile, yard
-    - Weight: kg, g, mg, pound, ounce, ton
-    - Temperature: celsius, fahrenheit, kelvin
-    - Area: m2, km2, cm2, acre, hectare
-    """
-    # Conversion factors to base SI units
-    conversions = {
-        # Length (base unit: meter)
-        "m": 1.0, "km": 1000.0, "cm": 0.01, "mm": 0.001,
-        "inch": 0.0254, "foot": 0.3048, "mile": 1609.344, "yard": 0.9144,
-        
-        # Weight (base unit: kilogram)
-        "kg": 1.0, "g": 0.001, "mg": 0.000001,
-        "pound": 0.453592, "ounce": 0.0283495, "ton": 1000.0,
-        
-        # Area (base unit: square meter)
-        "m2": 1.0, "km2": 1000000.0, "cm2": 0.0001,
-        "acre": 4046.86, "hectare": 10000.0,
+    """Convert common length, weight, temperature, and area units."""
+    unit_aliases = {
+        "meter": "m",
+        "meters": "m",
+        "kilometer": "km",
+        "kilometers": "km",
+        "centimeter": "cm",
+        "centimeters": "cm",
+        "millimeter": "mm",
+        "millimeters": "mm",
+        "inches": "inch",
+        "ft": "foot",
+        "feet": "foot",
+        "mi": "mile",
+        "miles": "mile",
+        "yards": "yard",
+        "kilogram": "kg",
+        "kilograms": "kg",
+        "gram": "g",
+        "grams": "g",
+        "milligram": "mg",
+        "milligrams": "mg",
+        "lb": "pound",
+        "lbs": "pound",
+        "pounds": "pound",
+        "oz": "ounce",
+        "ounces": "ounce",
+        "tons": "ton",
+        "c": "celsius",
+        "f": "fahrenheit",
+        "k": "kelvin",
+        "square_meter": "m2",
+        "square_meters": "m2",
+        "square_kilometer": "km2",
+        "square_kilometers": "km2",
+        "acres": "acre",
+        "hectares": "hectare",
     }
-    
-    from_unit = from_unit.lower()
-    to_unit = to_unit.lower()
-    
-    # Special handling for temperature
+
+    conversions = {
+        "m": 1.0,
+        "km": 1000.0,
+        "cm": 0.01,
+        "mm": 0.001,
+        "inch": 0.0254,
+        "foot": 0.3048,
+        "mile": 1609.344,
+        "yard": 0.9144,
+        "kg": 1.0,
+        "g": 0.001,
+        "mg": 0.000001,
+        "pound": 0.453592,
+        "ounce": 0.0283495,
+        "ton": 1000.0,
+        "m2": 1.0,
+        "km2": 1000000.0,
+        "cm2": 0.0001,
+        "acre": 4046.86,
+        "hectare": 10000.0,
+    }
+
+    original_from_unit = from_unit
+    original_to_unit = to_unit
+    from_unit = from_unit.lower().strip()
+    to_unit = to_unit.lower().strip()
+    from_unit = unit_aliases.get(from_unit, from_unit)
+    to_unit = unit_aliases.get(to_unit, to_unit)
+
     if from_unit in ["celsius", "fahrenheit", "kelvin"]:
         if from_unit == "celsius" and to_unit == "fahrenheit":
-            result = value * 9/5 + 32
+            result = value * 9 / 5 + 32
         elif from_unit == "fahrenheit" and to_unit == "celsius":
-            result = (value - 32) * 5/9
+            result = (value - 32) * 5 / 9
         elif from_unit == "celsius" and to_unit == "kelvin":
             result = value + 273.15
         elif from_unit == "kelvin" and to_unit == "celsius":
             result = value - 273.15
         elif from_unit == "fahrenheit" and to_unit == "kelvin":
-            result = (value - 32) * 5/9 + 273.15
+            result = (value - 32) * 5 / 9 + 273.15
         elif from_unit == "kelvin" and to_unit == "fahrenheit":
-            result = (value - 273.15) * 9/5 + 32
+            result = (value - 273.15) * 9 / 5 + 32
         else:
             result = value
-        return f"{value} {from_unit} = {result:.4g} {to_unit}"
-    
-    # Other units
+        return f"{value} {original_from_unit} = {result:.4g} {original_to_unit}"
+
     if from_unit not in conversions or to_unit not in conversions:
         return f"Unsupported unit: {from_unit} or {to_unit}"
-    
-    # Convert
+
     result = value * conversions[from_unit] / conversions[to_unit]
-    return f"{value} {from_unit} = {result:.6g} {to_unit}"
+    return f"{value} {original_from_unit} = {result:.6g} {original_to_unit}"
 
 
 # ============================
@@ -188,84 +275,57 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_web",
-            "description": """Search the internet for real-time information.
-            
-Suitable for:
-- Querying the latest news, events, prices, and other real-time data
-- Getting background information on people, places, and events
-- Finding technical documentation and tutorials
-- Verifying and fact-checking information
-
-Not suitable for:
-- Mathematical calculations (use the calculate tool)
-- Unit conversions (use the unit_converter tool)
-- Questions you already know the answer to""",
+            "description": "Search the internet for current or factual information.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search keywords, keep concise and precise. E.g.: 'Python 3.12 new features' rather than 'I want to know what new features the latest Python version has'"
+                        "description": "Concise search keywords.",
                     },
                     "num_results": {
                         "type": "integer",
-                        "description": "Number of results to return, default 5, max 10",
-                        "default": 5
-                    }
+                        "description": "Number of related results to return, max 10.",
+                        "default": 5,
+                    },
                 },
-                "required": ["query"]
-            }
-        }
+                "required": ["query"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "calculate",
-            "description": """Precisely evaluate mathematical expressions.
-            
-Supports: basic arithmetic (+,-,*,/,**), math functions (sqrt/sin/cos/log etc.), constants (pi/e)
-
-Examples:
-- "1234 * 5678" → precise multiplication
-- "sqrt(2) * pi" → calculation with math constants
-- "log(100) / log(10)" → logarithm calculation""",
+            "description": "Precisely evaluate mathematical expressions.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "expression": {
                         "type": "string",
-                        "description": "Mathematical expression using Python syntax. Use ** for exponentiation, not ^"
+                        "description": "Math expression, e.g. sqrt(2) * pi.",
                     }
                 },
-                "required": ["expression"]
-            }
-        }
+                "required": ["expression"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "unit_converter",
-            "description": "Unit conversion supporting common conversions for length, weight, temperature, area, and more",
+            "description": "Convert common length, weight, temperature, and area units.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "value": {
-                        "type": "number",
-                        "description": "The numeric value to convert"
-                    },
-                    "from_unit": {
-                        "type": "string",
-                        "description": "Source unit, e.g.: m, km, kg, celsius, pound"
-                    },
-                    "to_unit": {
-                        "type": "string",
-                        "description": "Target unit, e.g.: foot, mile, pound, fahrenheit"
-                    }
+                    "value": {"type": "number", "description": "Numeric value."},
+                    "from_unit": {"type": "string", "description": "Source unit."},
+                    "to_unit": {"type": "string", "description": "Target unit."},
                 },
-                "required": ["value", "from_unit", "to_unit"]
-            }
-        }
-    }
+                "required": ["value", "from_unit", "to_unit"],
+            },
+        },
+    },
 ]
 
 TOOL_FUNCTIONS = {
@@ -275,163 +335,138 @@ TOOL_FUNCTIONS = {
 }
 
 
-# ============================
-# Agent Class
-# ============================
+@dataclass
+class ToolTrace:
+    step: int
+    name: str
+    arguments: dict[str, Any]
+    result: str
+
 
 class SearchCalcAgent:
-    """Search + Calculation Agent"""
-    
+    """OpenAI function-calling agent with a trace-friendly response."""
+
     def __init__(self):
-        self.messages = [
-            {
-                "role": "system",
-                "content": """You are an intelligent assistant capable of searching and calculating.
+        self.messages = [self._system_message()]
 
-You have three tools:
-1. search_web: Search the internet for real-time information
-2. calculate: Precisely evaluate mathematical expressions
-3. unit_converter: Convert between units
+    @staticmethod
+    def _system_message() -> dict[str, str]:
+        return {
+            "role": "system",
+            "content": (
+                "You are an intelligent assistant that can search the web, "
+                "perform precise calculations, and convert units.\n\n"
+                "Strategy:\n"
+                "- Use search_web for current facts, prices, news, or references.\n"
+                "- Use calculate for arithmetic and math expressions.\n"
+                "- Use unit_converter for unit conversions.\n"
+                "- Complex questions may require multiple tools.\n\n"
+                "Answer concisely. Mention uncertainty when search results are weak."
+            ),
+        }
 
-Usage strategy:
-- Questions requiring real-time data (prices, news, weather, etc.) → search first
-- Mathematical calculations → use the calculator directly, do not calculate manually
-- Unit conversions → use unit_converter
-- Complex problems can combine multiple tools
-- When giving answers, indicate the source of information
+    def reset(self) -> None:
+        self.messages = [self._system_message()]
 
-Answer requirements:
-- Concise and accurate, highlight key points
-- Numerical calculation results must be precise
-- If search results are insufficient, say so honestly
-"""
-            }
-        ]
-        self.step_count = 0
-    
-    def _log_tool_call(self, tool_name: str, args: dict, result: str):
-        """Log tool call details"""
-        console.print(
-            Panel(
-                f"[bold]Tool:[/bold] [yellow]{tool_name}[/yellow]\n"
-                f"[bold]Args:[/bold] {json.dumps(args, ensure_ascii=False)}\n"
-                f"[bold]Result:[/bold] {result[:300]}{'...' if len(result) > 300 else ''}",
-                title=f"🔧 Tool Call #{self.step_count}",
-                border_style="yellow",
-                expand=False
-            )
-        )
-    
-    def chat(self, user_message: str) -> str:
-        """Chat with the Agent"""
-        self.step_count = 0
+    def chat(self, user_message: str) -> dict[str, Any]:
         self.messages.append({"role": "user", "content": user_message})
-        
-        console.print(f"\n[bold blue]👤 User:[/bold blue] {user_message}\n")
-        
-        MAX_STEPS = 8
-        
-        while self.step_count < MAX_STEPS:
-            # Call the LLM
-            response = client.chat.completions.create(
+        traces: list[ToolTrace] = []
+        max_steps = 8
+
+        for _ in range(max_steps):
+            response = get_openai_client().chat.completions.create(
                 model="gpt-4o",
                 messages=self.messages,
                 tools=TOOLS,
                 tool_choice="auto",
-                parallel_tool_calls=True
+                parallel_tool_calls=True,
             )
-            
+
             message = response.choices[0].message
             finish_reason = response.choices[0].finish_reason
             self.messages.append(message)
-            
-            # Direct answer
+
             if finish_reason == "stop":
-                console.print(f"\n[bold green]🤖 Agent:[/bold green]")
-                console.print(Markdown(message.content))
-                return message.content
-            
-            # Tool calls
+                return {
+                    "answer": message.content or "",
+                    "tool_calls": [asdict(trace) for trace in traces],
+                }
+
             if finish_reason == "tool_calls" and message.tool_calls:
                 for tool_call in message.tool_calls:
-                    self.step_count += 1
-                    
-                    func_name = tool_call.function.name
-                    func_args = json.loads(tool_call.function.arguments)
-                    
-                    # Execute tool
-                    func = TOOL_FUNCTIONS.get(func_name)
-                    if func:
-                        result = func(**func_args)
-                    else:
-                        result = f"Error: unknown tool {func_name}"
-                    
-                    self._log_tool_call(func_name, func_args, str(result))
-                    
-                    # Add tool result
-                    self.messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": str(result)
-                    })
-        
-        return "Maximum step limit reached"
-    
-    def reset(self):
-        """Reset the conversation"""
-        self.messages = self.messages[:1]
+                    try:
+                        func_name = tool_call.function.name
+                        func_args = json.loads(tool_call.function.arguments)
+                        func = TOOL_FUNCTIONS.get(func_name)
+                        result = func(**func_args) if func else f"Unknown tool: {func_name}"
+                    except Exception as exc:
+                        func_name = tool_call.function.name
+                        func_args = {}
+                        result = f"Tool execution failed: {exc}"
+
+                    traces.append(
+                        ToolTrace(
+                            step=len(traces) + 1,
+                            name=func_name,
+                            arguments=func_args,
+                            result=str(result),
+                        )
+                    )
+                    self.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": str(result),
+                        }
+                    )
+
+        return {
+            "answer": "Maximum step limit reached before the agent produced a final answer.",
+            "tool_calls": [asdict(trace) for trace in traces],
+        }
 
 
 # ============================
-# Main Program
+# Web App
 # ============================
 
-def demo():
-    """Demonstrate Agent capabilities"""
-    agent = SearchCalcAgent()
-    
-    test_questions = [
-        "How far is the Earth from the Moon in kilometers? How many miles is that?",
-        "If I save $2,000 per month at an annual interest rate of 3%, how much will I have after 5 years?",
-        "What are the important new features in Python 3.12?",
-        "How many kilometers is 1 mile? Approximately how many miles is the high-speed rail distance from Beijing to Shanghai?",
-    ]
-    
-    for q in test_questions:
-        agent.chat(q)
-        agent.reset()
-        print("\n" + "="*60 + "\n")
+app = FastAPI(title="SearchCalc Agent")
+agent = SearchCalcAgent()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
-def interactive():
-    """Interactive mode"""
-    console.print(Panel(
-        "[bold]🔍 Search + Calculation Agent[/bold]\n"
-        "I can search the internet + perform precise calculations + convert units\n"
-        "Type 'quit' to exit, 'reset' to reset the conversation",
-        title="Agent Started",
-        border_style="green"
-    ))
-    
-    agent = SearchCalcAgent()
-    
-    while True:
-        user_input = input("\n💬 You: ").strip()
-        if not user_input:
-            continue
-        if user_input.lower() == "quit":
-            break
-        if user_input.lower() == "reset":
-            agent.reset()
-            console.print("[dim]Conversation reset[/dim]")
-            continue
-        
-        agent.chat(user_input)
+class ChatRequest(BaseModel):
+    message: str
 
 
-if __name__ == "__main__":
-    import sys
-    if "--demo" in sys.argv:
-        demo()
-    else:
-        interactive()
+@app.get("/")
+def index() -> FileResponse:
+    return FileResponse("static/index.html")
+
+
+@app.post("/api/chat")
+def api_chat(payload: ChatRequest) -> dict[str, Any]:
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+    try:
+        return agent.chat(message)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Agent request failed: {exc}") from exc
+
+
+@app.post("/api/reset")
+def api_reset() -> dict[str, str]:
+    agent.reset()
+    return {"status": "reset"}
